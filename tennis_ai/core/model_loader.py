@@ -2,47 +2,77 @@
 Weight loading & model initialisation.
 
 Handles:
-  - Loading pre-trained weights from disk
-  - Downloading weights from the open-source repo if missing
+  - Loading pre-trained weights with automatic key adaptation
+  - Downloading weights from yastrebksv/TrackNet (MIT License)
   - Moving model to GPU + optional FP16
+
+Weight source: yastrebksv/TrackNet (PyTorch, MIT License)
+https://github.com/yastrebksv/TrackNet
 """
 import logging
-import urllib.request
+import subprocess
+import sys
 from pathlib import Path
 
 import torch
 
 from core.tracknet_model import TrackNetV2
+from core.weight_adapter import adapt_state_dict
 from config.settings import TRACKNET, TRACKNET_WEIGHTS, DEVICE, USE_FP16
 from utils.device import get_device, to_fp16_if_available
 
 logger = logging.getLogger(__name__)
 
-# Public weights trained on the TrackNet dataset (Chang-Chia-Chi, MIT License)
-_WEIGHTS_URL = (
-    "https://github.com/Chang-Chia-Chi/TrackNet/releases/download/v1.0/"
-    "TrackNet_best.pt"
-)
+# Google Drive file ID — yastrebksv/TrackNet (MIT License)
+_GDRIVE_FILE_ID = "1XEYZ4myUN7QT-NeBYJI0xteLsvs-ZAOl"
+
+
+def _ensure_gdown() -> None:
+    """Install gdown if not already present."""
+    try:
+        import gdown  # noqa: F401
+    except ImportError:
+        logger.info("Installing gdown for Google Drive download...")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "gdown", "-q"]
+        )
 
 
 def _download_weights(dest: Path) -> None:
+    """Download TrackNet weights from Google Drive via gdown."""
+    _ensure_gdown()
+    import gdown
+
     dest.parent.mkdir(parents=True, exist_ok=True)
+    url = f"https://drive.google.com/uc?id={_GDRIVE_FILE_ID}"
+
     logger.info(f"⬇️  Downloading TrackNet weights → {dest}")
-    logger.info("    Source: Chang-Chia-Chi/TrackNet (MIT License)")
+    logger.info(f"   Source: yastrebksv/TrackNet (MIT License)")
+    gdown.download(url, str(dest), quiet=False)
 
-    def _progress(block, block_size, total):
-        if total > 0:
-            pct = min(block * block_size / total * 100, 100)
-            print(f"\r    {pct:.1f}%", end="", flush=True)
+    if not dest.exists():
+        raise RuntimeError(
+            f"Download failed. Manual fallback:\n"
+            f"  1. Open: https://drive.google.com/file/d/{_GDRIVE_FILE_ID}\n"
+            f"  2. Download and save as: {dest}"
+        )
+    size_mb = dest.stat().st_size / 1e6
+    logger.info(f"✅ Weights downloaded ({size_mb:.1f} MB)")
 
-    urllib.request.urlretrieve(_WEIGHTS_URL, dest, reporthook=_progress)
-    print()  # newline after progress
-    logger.info("✅ Weights downloaded.")
+
+def _load_raw_state(path: Path) -> dict:
+    """Load and unwrap checkpoint dict → raw state_dict."""
+    state = torch.load(str(path), map_location="cpu", weights_only=False)
+    if isinstance(state, dict):
+        for key in ("model_state_dict", "state_dict"):
+            if key in state:
+                return state[key]
+    return state
 
 
 def load_model(weights_path: Path = TRACKNET_WEIGHTS) -> torch.nn.Module:
     """
-    Build TrackNetV2, load weights, move to GPU, optionally cast to FP16.
+    Build TrackNetV2, load adapted weights, move to GPU.
     Returns the model in eval mode — ready for inference.
     """
     device = get_device(DEVICE)
@@ -54,23 +84,24 @@ def load_model(weights_path: Path = TRACKNET_WEIGHTS) -> torch.nn.Module:
         try:
             _download_weights(weights_path)
         except Exception as exc:
-            logger.error(
-                f"Auto-download failed: {exc}\n"
-                "Please download weights manually:\n"
-                f"  {_WEIGHTS_URL}\n"
-                f"  → save to {weights_path}"
-            )
+            logger.error(f"Auto-download failed: {exc}")
             raise
 
-    state = torch.load(weights_path, map_location=device, weights_only=False)
-    # Support both raw state_dict and checkpoint dicts
-    if "model_state_dict" in state:
-        state = state["model_state_dict"]
-    elif "state_dict" in state:
-        state = state["state_dict"]
+    # Load raw state and adapt keys to our model
+    raw_state = _load_raw_state(weights_path)
+    adapted = adapt_state_dict(model, raw_state)
 
-    model.load_state_dict(state, strict=False)
-    logger.info(f"✅ TrackNet weights loaded from {weights_path}")
+    # Load with strict=True — adapter already handled remapping
+    missing, unexpected = model.load_state_dict(adapted, strict=False)
+
+    loaded = len(adapted)
+    total = len(model.state_dict())
+    logger.info(f"✅ Loaded {loaded}/{total} weight tensors from {weights_path}")
+
+    if missing:
+        logger.warning(f"   {len(missing)} keys still missing (random init)")
+    if unexpected:
+        logger.warning(f"   {len(unexpected)} unexpected keys ignored")
 
     model = to_fp16_if_available(model.to(device), USE_FP16)
     model.eval()

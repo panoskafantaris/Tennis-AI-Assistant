@@ -1,16 +1,20 @@
 """
 TrackNet inference engine.
 
-Pre/post-processing + forward pass.
-Post-processing uses a margin score (non-bg logit minus bg logit) and
-blob-size filtering to isolate the small, compact tennis ball peak.
+Pre-processing  : BGR->RGB, resize, float32 [0,255]
+Forward pass    : model outputs [B, 256, H, W] logits
+Post-processing : argmax -> background subtraction -> blob filter
+
+The model predicts class ~140 for background and peaks near 233
+for ball pixels. Subtracting the background mode isolates the
+ball signal cleanly.
 """
 import cv2
 import numpy as np
 import torch
 from typing import Optional, Tuple
 
-from config.settings import TRACKNET, DEVICE
+from config.settings import TRACKNET, POSTPROCESS, DEVICE
 from utils.device import get_device
 
 
@@ -25,83 +29,104 @@ class TrackNetInference:
         self.device = get_device(DEVICE)
         self.H      = TRACKNET["input_height"]
         self.W      = TRACKNET["input_width"]
-        self.thresh = TRACKNET["heatmap_thresh"]
+        self.color  = TRACKNET["color_mode"]
+        self._bg_level = None  # estimated once, reused
+
+    # ── Preprocessing ─────────────────────────────────────────────
 
     def _preprocess(self, frames: list) -> torch.Tensor:
-        """Stack 3 BGR frames → normalised 9-channel tensor [1, 9, H, W]."""
+        """Stack 3 BGR frames -> [1, 9, H, W] float32 in [0,255]."""
         channels = []
         for bgr in frames:
-            rgb = cv2.cvtColor(
-                cv2.resize(bgr, (self.W, self.H)),
-                cv2.COLOR_BGR2RGB,
-            ).astype(np.float32) / 255.0
-            channels.append(torch.from_numpy(rgb).permute(2, 0, 1))
+            resized = cv2.resize(bgr, (self.W, self.H))
+            if self.color == "rgb":
+                img = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+            else:
+                img = resized
+            t = torch.from_numpy(img.astype(np.float32)).permute(2, 0, 1)
+            channels.append(t)
         return torch.cat(channels, dim=0).unsqueeze(0).to(self.device)
 
-    def _find_ball_peak(
+    # ── Post-processing ───────────────────────────────────────────
+
+    def _find_ball(
         self,
-        score_map: np.ndarray,
+        heatmap: np.ndarray,
         orig_h: int,
         orig_w: int,
     ) -> Optional[Tuple[int, int, float]]:
         """
-        Find the most ball-like peak in score_map.
+        Background-subtracted blob detection.
 
-        Strategy:
-          1. Threshold at top-N% of values to get candidate regions.
-          2. Find connected components and filter by area (ball is small).
-          3. Pick the component whose peak value is highest.
-
-        This avoids large blobs (crowd, players) dominating over the tiny ball.
+        1. Compute background mode (most common argmax value)
+        2. Subtract it -> residual (ball peaks above zero)
+        3. Threshold at fraction of max residual
+        4. Find small blobs -> pick highest peak
         """
-        # Normalise to 0-255 uint8 for OpenCV
-        s_min, s_max = score_map.min(), score_map.max()
-        if s_max - s_min < 1e-6:
-            return None
+        # Estimate background level from histogram mode
+        hist, edges = np.histogram(heatmap.ravel(), bins=256, range=(0, 256))
+        bg_level = float(edges[hist.argmax()])
 
-        norm = ((score_map - s_min) / (s_max - s_min) * 255).astype(np.uint8)
+        # Update running estimate (smooth across frames)
+        if self._bg_level is None:
+            self._bg_level = bg_level
+        else:
+            self._bg_level = 0.9 * self._bg_level + 0.1 * bg_level
 
-        # Threshold: keep top 5% of pixels as candidates
-        thresh_val = int(255 * (1 - self.thresh))
-        _, binary  = cv2.threshold(norm, thresh_val, 255, cv2.THRESH_BINARY)
+        # Residual heatmap
+        residual = np.clip(heatmap - self._bg_level, 0, None)
+        r_max = residual.max()
 
-        # Find connected components
+        if r_max < 5.0:
+            return None  # no ball signal
+
+        # Threshold at configured fraction of max
+        thresh_frac = POSTPROCESS["heatmap_thresh"]
+        norm_res = (residual / r_max * 255).astype(np.uint8)
+        thresh_val = int(thresh_frac * 255)
+        _, binary = cv2.threshold(
+            norm_res, thresh_val, 255, cv2.THRESH_BINARY
+        )
+
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
             binary, connectivity=8
         )
-
         if num_labels <= 1:
             return None
 
-        # Image area — ball should occupy 0.01% to 2% of frame
-        total_px   = self.H * self.W
-        min_area   = max(1,  int(total_px * 0.0001))
-        max_area   = int(total_px * 0.02)
+        min_area = POSTPROCESS["min_blob_area"]
+        max_area = POSTPROCESS["max_blob_area"]
 
-        best_score = -1.0
+        best_peak = -1.0
         best_cx, best_cy = None, None
 
-        for i in range(1, num_labels):          # skip background label 0
+        for i in range(1, num_labels):
             area = int(stats[i, cv2.CC_STAT_AREA])
             if not (min_area <= area <= max_area):
                 continue
-
-            # Score = peak value of the score_map within this component
-            mask       = (labels == i)
-            peak_score = float(score_map[mask].max())
-            if peak_score > best_score:
-                best_score = peak_score
-                cx = int(stats[i, cv2.CC_STAT_LEFT] + stats[i, cv2.CC_STAT_WIDTH]  / 2)
-                cy = int(stats[i, cv2.CC_STAT_TOP]  + stats[i, cv2.CC_STAT_HEIGHT] / 2)
+            mask = (labels == i)
+            peak = float(residual[mask].max())
+            if peak > best_peak:
+                best_peak = peak
+                cx = int(
+                    stats[i, cv2.CC_STAT_LEFT]
+                    + stats[i, cv2.CC_STAT_WIDTH] / 2
+                )
+                cy = int(
+                    stats[i, cv2.CC_STAT_TOP]
+                    + stats[i, cv2.CC_STAT_HEIGHT] / 2
+                )
                 best_cx, best_cy = cx, cy
 
         if best_cx is None:
             return None
 
-        confidence = (best_score - s_min) / (s_max - s_min)
+        confidence = min(best_peak / r_max, 1.0)
         x = int(best_cx * orig_w / self.W)
         y = int(best_cy * orig_h / self.H)
         return x, y, float(confidence)
+
+    # ── Main predict ──────────────────────────────────────────────
 
     @torch.no_grad()
     def predict(
@@ -116,15 +141,8 @@ class TrackNetInference:
             return None
 
         orig_h, orig_w = frames[-1].shape[:2]
-        tensor         = self._preprocess(frames)
+        tensor = self._preprocess(frames)
+        logits = self.model(tensor)[0]  # [256, H, W]
 
-        out = self.model(tensor)[0].float()   # [256, H, W]
-
-        # Margin score: best non-bg logit minus background logit.
-        # Where ball is present the non-bg class should pull ahead of bg.
-        # Even if bg wins globally, the ball pixel has the smallest gap.
-        non_bg_max = out[1:].max(dim=0).values   # [H, W]
-        bg_logit   = out[0]                       # [H, W]
-        score_map  = (non_bg_max - bg_logit).cpu().numpy()   # [H, W]
-
-        return self._find_ball_peak(score_map, orig_h, orig_w)
+        heatmap = logits.argmax(dim=0).cpu().numpy().astype(np.float32)
+        return self._find_ball(heatmap, orig_h, orig_w)
