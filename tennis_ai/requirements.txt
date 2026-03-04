@@ -1,16 +1,13 @@
 # Tennis AI — Dependencies
 # All packages are open-source and free.
 
-# Core ML — install the CUDA 12.x build for RTX 4050
-# Run: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-# torch>=2.1.0
-# torchvision>=0.16.0
+# Core ML — install PyTorch with CUDA 12.x for RTX 4050:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
 # Computer vision
 opencv-python>=4.8.0
 
-# YouTube video download (open-source, Unlicense)
-# https://github.com/yt-dlp/yt-dlp
+# YouTube video download (Unlicense)
 yt-dlp>=2024.1.0
 
 # Utilities

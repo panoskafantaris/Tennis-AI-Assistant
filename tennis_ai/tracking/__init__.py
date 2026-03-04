@@ -1,4 +1,3 @@
-from .ball_tracker import BallTracker, BallState
-from .frame_buffer import FrameBuffer
-from .hybrid_detector import HybridBallDetector
-from .roi_filter import ROIFilter
+from .tracker import BallTracker, BallState
+from .buffer import FrameBuffer
+from .filters import ROIFilter, VelocityFilter
