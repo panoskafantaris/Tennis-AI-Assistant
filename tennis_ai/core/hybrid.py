@@ -5,7 +5,7 @@ Works without pre-trained weights.
 Pipeline per 3-frame window:
   1. Frame differencing -> isolate moving pixels
   2. HSV color filter   -> keep yellow-green ball range
-  3. Combine masks + morphological cleanup
+  3. Combine masks (OR logic with scoring, not strict AND)
   4. Contour analysis   -> filter by area + circularity
   5. Pick best candidate
 """
@@ -37,16 +37,22 @@ class HybridDetector(BaseDetector):
         f1, f2, f3 = frames[-3], frames[-2], frames[-1]
         h, w = f3.shape[:2]
 
-        min_area = np.pi * max(2, int(h * HYBRID["min_radius_frac"])) ** 2
-        max_area = np.pi * int(h * HYBRID["max_radius_frac"]) ** 2
+        min_area = max(3, int(np.pi * (h * HYBRID["min_radius_frac"]) ** 2))
+        max_area = int(np.pi * (h * HYBRID["max_radius_frac"]) ** 2)
 
         color_m  = self._color_mask(f3)
         motion_m = self._motion_mask(f1, f2, f3)
-        combined = cv2.bitwise_and(color_m, motion_m)
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        # Use OR logic: accept pixels that match color OR motion
+        # Then score candidates by how many signals they match
+        combined = cv2.bitwise_or(color_m, motion_m)
+
+        # Smaller kernel — preserves tiny ball blobs
+        ksize = HYBRID.get("morph_kernel", 3)
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (ksize, ksize),
+        )
         combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
-        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel)
 
         contours, _ = cv2.findContours(
             combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
@@ -65,8 +71,15 @@ class HybridDetector(BaseDetector):
                 continue
             cx = int(M["m10"] / M["m00"])
             cy = int(M["m01"] / M["m00"])
-            if best is None or circ > best[2]:
-                best = (cx, cy, float(circ))
+
+            # Score: circularity + bonus if both color AND motion match
+            has_color = color_m[cy, cx] > 0
+            has_motion = motion_m[cy, cx] > 0
+            bonus = 0.3 if (has_color and has_motion) else 0.0
+            score = circ + bonus
+
+            if best is None or score > best[2]:
+                best = (cx, cy, float(score))
         return best
 
     @classmethod

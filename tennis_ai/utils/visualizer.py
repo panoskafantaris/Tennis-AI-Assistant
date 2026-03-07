@@ -8,12 +8,22 @@ from config.settings import VIZ
 
 def draw_ball(
     frame: np.ndarray, x: int, y: int, confidence: float,
+    predicted: bool = False,
 ) -> np.ndarray:
+    """Draw ball marker. Uses different color for predicted positions."""
     r = VIZ["ball_radius"]
+    color = VIZ["predicted_color"] if predicted else VIZ["ball_color"]
+
     cv2.circle(frame, (x, y), r + 4, (0, 0, 0), 2)
-    cv2.circle(frame, (x, y), r, VIZ["ball_color"], -1)
+    if predicted:
+        # Dashed circle effect for predicted — draw ring instead of fill
+        cv2.circle(frame, (x, y), r, color, 2)
+    else:
+        cv2.circle(frame, (x, y), r, color, -1)
+
+    label = f"{confidence:.2f}" + (" P" if predicted else "")
     cv2.putText(
-        frame, f"{confidence:.2f}", (x + r + 4, y - r),
+        frame, label, (x + r + 4, y - r),
         cv2.FONT_HERSHEY_SIMPLEX, 0.45, VIZ["text_color"], 1, cv2.LINE_AA,
     )
     return frame

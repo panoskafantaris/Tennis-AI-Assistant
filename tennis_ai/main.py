@@ -2,9 +2,10 @@
 Tennis AI — Ball Tracking Pipeline.
 
 Usage:
-    python main.py --source video.mp4                          # hybrid (default)
+    python main.py --source video.mp4                          # ensemble (default)
+    python main.py --source video.mp4 --detector hybrid        # hybrid only
     python main.py --source video.mp4 --detector tracknetv3    # TrackNetV3
-    python main.py --source video.mp4 --detector tracknetv2    # TrackNetV2
+    python main.py --source video.mp4 --two-pass               # full interpolation
     python main.py --source "https://youtube.com/..." --save out.mp4
     python main.py --source video.mp4 --max-frames 200
 """
@@ -17,9 +18,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from config.settings import OUTPUT_DIR, VIZ, V3
+from config.settings import OUTPUT_DIR, VIZ, V3, BGSUB, COURT_ZONE
 from core.base import BaseDetector
-from tracking import BallTracker, FrameBuffer, ROIFilter, VelocityFilter
+from tracking import BallTracker, FrameBuffer, ROIFilter
+from tracking.court_zone import CourtZoneFilter
+from tracking.stationarity import StationarityFilter
 from utils import draw_ball, draw_trail, draw_hud
 from video import VideoReader, VideoWriter
 
@@ -33,45 +36,20 @@ logger = logging.getLogger("main")
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Tennis AI — Ball Tracker")
-    p.add_argument("--source", required=True,
-                   help="Video file or YouTube URL")
-    p.add_argument("--detector", default="hybrid",
-                   choices=["hybrid", "tracknetv2", "tracknetv3"])
-    p.add_argument("--weights", default=None,
-                   help="Custom weights path (optional)")
-    p.add_argument("--save", default=None,
-                   help="Output video path")
-    p.add_argument("--no-display", action="store_true",
-                   help="Disable live preview")
+    p.add_argument("--source", required=True)
+    p.add_argument("--detector", default="ensemble",
+                   choices=["ensemble", "hybrid", "tracknetv2", "tracknetv3"])
+    p.add_argument("--weights", default=None)
+    p.add_argument("--save", default=None)
+    p.add_argument("--no-display", action="store_true")
     p.add_argument("--max-frames", type=int, default=None)
+    p.add_argument("--two-pass", action="store_true",
+                   help="Enable two-pass interpolation for gap filling")
     return p.parse_args()
 
 
-def build_detector(args, source: str) -> BaseDetector:
-    """Factory for the chosen detection backend."""
-    weights = Path(args.weights) if args.weights else None
-
-    if args.detector == "hybrid":
-        from core.hybrid import HybridDetector
-        logger.info("Using HybridDetector (no weights)")
-        return HybridDetector()
-
-    if args.detector == "tracknetv3":
-        from core.tracknet_v3 import TrackNetV3Detector
-        logger.info("Loading TrackNetV3...")
-        det = TrackNetV3Detector(weights)
-        bg = _sample_background(source, V3["bg_samples"])
-        det.set_background(bg)
-        return det
-
-    # tracknetv2
-    from core.tracknet_v2 import TrackNetV2Detector
-    logger.info("Loading TrackNetV2...")
-    return TrackNetV2Detector(weights)
-
-
-def _sample_background(source: str, n: int = 50) -> list:
-    """Sample N frames evenly across video for V3 background."""
+def sample_background(source: str, n: int = 50) -> list:
+    """Sample N frames evenly across video for background model."""
     cap = cv2.VideoCapture(source)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 500
     frames = []
@@ -85,16 +63,47 @@ def _sample_background(source: str, n: int = 50) -> list:
     return frames
 
 
-def run(args: argparse.Namespace) -> None:
+def build_detector(args, source: str) -> BaseDetector:
+    """Factory for detection backend."""
+    weights = Path(args.weights) if args.weights else None
+
+    if args.detector == "ensemble":
+        from core.ensemble_detector import EnsembleDetector
+        logger.info("Using EnsembleDetector (bg-sub + hybrid + Kalman)")
+        det = EnsembleDetector()
+        bg = sample_background(source, BGSUB["bg_samples"])
+        det.set_background(bg)
+        return det
+
+    if args.detector == "hybrid":
+        from core.hybrid import HybridDetector
+        logger.info("Using HybridDetector (improved)")
+        return HybridDetector()
+
+    if args.detector == "tracknetv3":
+        from core.tracknet_v3 import TrackNetV3Detector
+        det = TrackNetV3Detector(weights)
+        bg = sample_background(source, V3["bg_samples"])
+        det.set_background(bg)
+        return det
+
+    from core.tracknet_v2 import TrackNetV2Detector
+    return TrackNetV2Detector(weights)
+
+
+def run_single_pass(args: argparse.Namespace) -> None:
+    """Standard single-pass pipeline (real-time capable)."""
     detector = build_detector(args, args.source)
     tracker  = BallTracker()
     buf      = FrameBuffer(size=detector.window_size)
-    roi      = ROIFilter()
-    vel      = VelocityFilter()
+    court    = CourtZoneFilter()
+    static   = StationarityFilter()
+    roi      = ROIFilter()  # fallback if court zone not calibrated
 
     frame_idx = 0
     fps_timer = time.time()
     fps_disp  = 0.0
+    court_calibrated = False
 
     with VideoReader(args.source) as vr:
         out_path = Path(args.save) if args.save else OUTPUT_DIR / "tracked.mp4"
@@ -103,6 +112,11 @@ def run(args: argparse.Namespace) -> None:
                 frame_idx += 1
                 if args.max_frames and frame_idx > args.max_frames:
                     break
+
+                # Calibrate court zone on first frame
+                if not court_calibrated and COURT_ZONE["enabled"]:
+                    court.calibrate(frame)
+                    court_calibrated = True
 
                 now = time.time()
                 fps_disp = 0.9 * fps_disp + 0.1 / max(now - fps_timer, 1e-6)
@@ -115,8 +129,13 @@ def run(args: argparse.Namespace) -> None:
                 )
 
                 h, w = frame.shape[:2]
-                detection = roi(detection, h, w)
-                detection = vel(detection)
+                # Filter chain: court zone → stationarity → ROI fallback
+                if court_calibrated:
+                    detection = court(detection, h, w)
+                else:
+                    detection = roi(detection, h, w)
+                detection = static(detection)
+
                 state = tracker.update(detection)
 
                 viz = frame.copy()
@@ -137,6 +156,15 @@ def run(args: argparse.Namespace) -> None:
 
     cv2.destroyAllWindows()
     logger.info(f"Done. {frame_idx} frames -> {out_path}")
+
+
+def run(args: argparse.Namespace) -> None:
+    if args.two_pass:
+        from pipeline import run_two_pass
+        detector = build_detector(args, args.source)
+        run_two_pass(args.source, detector, args.save, args.max_frames)
+    else:
+        run_single_pass(args)
 
 
 if __name__ == "__main__":
