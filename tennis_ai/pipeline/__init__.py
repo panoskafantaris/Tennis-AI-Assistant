@@ -1,9 +1,14 @@
 """
 Two-pass pipeline — detect → interpolate → render.
 
-Pass 1: Run detector on all frames with court zone + stationarity filters.
+Pass 1: Detect with scene-cut-aware background + court zone + stationarity.
 Pass 2: Fill gaps with trajectory interpolation + smoothing.
-Pass 3: Render annotated video with full coverage.
+Pass 3: Render annotated video.
+
+Improvements:
+  - Scene cut detection resets all state per scene
+  - Background model rebuilt per scene
+  - Wider interpolation gaps for better coverage
 """
 import logging
 from pathlib import Path
@@ -11,11 +16,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from config.settings import OUTPUT_DIR, VIZ, COURT_ZONE
+from config.settings import OUTPUT_DIR, VIZ, COURT_ZONE, SCENE_CUT
 from core.base import BaseDetector
 from tracking import BallTracker, FrameBuffer, ROIFilter
 from tracking.court_zone import CourtZoneFilter
 from tracking.stationarity import StationarityFilter
+from tracking.scene_cut import SceneCutDetector
 from tracking.interpolator import (
     TrackPoint, interpolate_trajectory, smooth_trajectory,
 )
@@ -23,6 +29,29 @@ from utils import draw_ball, draw_trail, draw_hud
 from video import VideoReader, VideoWriter
 
 logger = logging.getLogger(__name__)
+
+
+def _rebuild_background(detector, frames: list, count: int = 30) -> None:
+    """Rebuild background model from recent scene frames."""
+    if not hasattr(detector, "set_background"):
+        return
+    if len(frames) < 5:
+        return
+    # Sample evenly from available frames
+    n = min(count, len(frames))
+    indices = np.linspace(0, len(frames) - 1, n).astype(int)
+    bg_frames = [frames[i] for i in indices]
+    detector.set_background(bg_frames)
+    logger.info(f"Background rebuilt from {n} scene frames")
+
+
+def _reset_pipeline(detector, court, static, buf) -> None:
+    """Reset all pipeline state after a scene cut."""
+    if hasattr(detector, "reset"):
+        detector.reset()
+    static.reset_full()
+    buf.clear()
+    logger.info("Pipeline state reset for new scene")
 
 
 def run_two_pass(
@@ -37,11 +66,16 @@ def run_two_pass(
     court = CourtZoneFilter()
     static = StationarityFilter()
     roi = ROIFilter()
+    scene_cut = SceneCutDetector()
 
     raw_frames = []
     raw_points: list = []
     frame_idx = 0
     court_calibrated = False
+
+    # Per-scene frame accumulator for background rebuild
+    scene_frames: list = []
+    bg_rebuild_count = SCENE_CUT.get("bg_rebuild_frames", 20)
 
     with VideoReader(source) as vr:
         fps = vr.fps
@@ -51,17 +85,34 @@ def run_two_pass(
             if max_frames and frame_idx > max_frames:
                 break
 
-            # Calibrate court zone on first frame
+            # Scene cut detection
+            if SCENE_CUT["enabled"] and scene_cut.check(frame):
+                logger.info(f"Scene cut at frame {frame_idx} — resetting")
+                _reset_pipeline(detector, court, static, buf)
+                court_calibrated = False
+                scene_frames.clear()
+
+            # Accumulate scene frames for background
+            scene_frames.append(frame)
+
+            # Rebuild background after accumulating enough scene frames
+            if len(scene_frames) == bg_rebuild_count:
+                _rebuild_background(detector, scene_frames)
+
+            # Calibrate court zone on first frame of each scene
             if not court_calibrated and COURT_ZONE["enabled"]:
                 court.calibrate(frame)
                 court_calibrated = True
+                # Share court mask with ensemble detector for pre-filtering
+                if hasattr(detector, 'set_court_mask') and court._mask is not None:
+                    detector.set_court_mask(court._mask)
 
             raw_frames.append(frame)
             buf.push(frame)
             det = detector.predict(buf.get_window()) if buf.ready() else None
             h, w = frame.shape[:2]
 
-            # Filter chain: court zone → stationarity
+            # Filter chain
             if court_calibrated:
                 det = court(det, h, w)
             else:
@@ -80,6 +131,8 @@ def run_two_pass(
     total = len(raw_points)
     logger.info(f"Pass 1: {detected}/{total} detected "
                 f"({detected / max(total, 1) * 100:.1f}%)")
+    if scene_cut.total_cuts > 0:
+        logger.info(f"Scene cuts detected: {scene_cut.total_cuts}")
 
     # Pass 2: interpolate and smooth
     logger.info("=== Pass 2: Interpolation ===")

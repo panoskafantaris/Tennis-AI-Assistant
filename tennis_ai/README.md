@@ -23,4 +23,4 @@ python main.py --source "https://www.youtube.com/watch?v=YOUR_VIDEO_ID" --max-fr
 python main.py --source tennis_match_2.mp4 --two-pass --max-frames 200
 
 # Old hybrid-only mode (now improved but still weaker)
-python main.py --source tennis_match_2.mp4 --detector hybrid
+python main.py --source tennis_match_2.mp4 --detector hybrid --max-frames 200

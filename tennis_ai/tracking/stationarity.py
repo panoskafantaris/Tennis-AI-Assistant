@@ -5,12 +5,14 @@ A tennis ball is always moving during play. If a detection sits at the
 same coordinates for several frames, it's a static false positive
 (logo dot, camera artifact, scoreboard element).
 
-Also rejects candidates that appear at known static FP locations
-accumulated during the run.
+Improvements:
+  - Blacklist entries have a TTL (expire after N frames)
+  - Full reset method for scene cuts
+  - Less aggressive blacklisting thresholds
 """
 import logging
 from collections import deque
-from typing import Deque, Optional, Set, Tuple
+from typing import Deque, Dict, Optional, Set, Tuple
 
 from config.settings import STATIONARITY
 
@@ -26,38 +28,45 @@ class StationarityFilter:
         self._history: Deque[Optional[Tuple[int, int]]] = deque(
             maxlen=STATIONARITY["window"],
         )
-        self._blacklist: Set[Tuple[int, int]] = set()
+        # Blacklist with TTL: grid_pos -> frames_remaining
+        self._blacklist: Dict[Tuple[int, int], int] = {}
         self._static_count = 0
+        self._frame_count = 0
+        self._ttl = STATIONARITY.get("blacklist_ttl", 300)
 
     def __call__(self, det: Detection) -> Detection:
+        self._frame_count += 1
+
+        # Decay blacklist TTL every frame
+        if self._frame_count % 10 == 0:
+            self._decay_blacklist()
+
         if det is None:
             self._history.append(None)
             self._static_count = 0
             return None
 
         x, y, conf = det
+        radius = STATIONARITY["radius"]
 
         # Check against blacklisted static positions
-        for bx, by in self._blacklist:
-            if abs(x - bx) < STATIONARITY["radius"] and \
-               abs(y - by) < STATIONARITY["radius"]:
+        grid_key = (x // radius * radius, y // radius * radius)
+        for bkey, ttl in self._blacklist.items():
+            if ttl <= 0:
+                continue
+            bx, by = bkey
+            if abs(x - bx) < radius and abs(y - by) < radius:
                 return None
 
-        # Check if position is static (same as recent history)
+        # Check if position is static
         is_static = self._check_static(x, y)
         self._history.append((x, y))
 
         if is_static:
             self._static_count += 1
             if self._static_count >= STATIONARITY["max_static_frames"]:
-                # Blacklist this position permanently
-                self._blacklist.add(
-                    (x // STATIONARITY["radius"] * STATIONARITY["radius"],
-                     y // STATIONARITY["radius"] * STATIONARITY["radius"]),
-                )
-                logger.info(
-                    f"Blacklisted static FP at ({x},{y})"
-                )
+                self._blacklist[grid_key] = self._ttl
+                logger.info(f"Blacklisted static FP at ({x},{y}) TTL={self._ttl}")
                 self._static_count = 0
                 return None
         else:
@@ -73,13 +82,28 @@ class StationarityFilter:
         radius = STATIONARITY["radius"]
         for pos in self._history:
             if pos is None:
-                return False  # gap means it's not stationary
+                return False
             px, py = pos
             if abs(x - px) > radius or abs(y - py) > radius:
                 return False
         return True
 
+    def _decay_blacklist(self) -> None:
+        """Reduce TTL of all blacklist entries, remove expired."""
+        expired = [k for k, v in self._blacklist.items() if v <= 0]
+        for k in expired:
+            del self._blacklist[k]
+        for k in self._blacklist:
+            self._blacklist[k] -= 10
+
     def reset(self) -> None:
+        """Full reset — call on scene cuts."""
         self._history.clear()
         self._static_count = 0
-        # Keep blacklist — static objects don't move between resets
+
+    def reset_full(self) -> None:
+        """Reset everything including blacklist — call on scene cuts."""
+        self._history.clear()
+        self._static_count = 0
+        self._blacklist.clear()
+        logger.info("Stationarity filter fully reset (blacklist cleared)")

@@ -18,11 +18,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from config.settings import OUTPUT_DIR, VIZ, V3, BGSUB, COURT_ZONE
+from config.settings import OUTPUT_DIR, VIZ, V3, BGSUB, COURT_ZONE, SCENE_CUT
 from core.base import BaseDetector
 from tracking import BallTracker, FrameBuffer, ROIFilter
 from tracking.court_zone import CourtZoneFilter
 from tracking.stationarity import StationarityFilter
+from tracking.scene_cut import SceneCutDetector
 from utils import draw_ball, draw_trail, draw_hud
 from video import VideoReader, VideoWriter
 
@@ -48,18 +49,25 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def sample_background(source: str, n: int = 50) -> list:
-    """Sample N frames evenly across video for background model."""
+def sample_background(source: str, n: int = 50, max_frame: int = None) -> list:
+    """Sample N frames from the FIRST scene for background model."""
     cap = cv2.VideoCapture(source)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 500
+    if max_frame:
+        total = min(total, max_frame)
+
+    # Sample from first 30% of video to avoid cross-scene contamination
+    sample_end = min(total, int(total * 0.3))
+    sample_end = max(sample_end, min(n * 2, total))
+
     frames = []
-    for idx in np.linspace(0, total - 1, n).astype(int):
+    for idx in np.linspace(0, sample_end - 1, n).astype(int):
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, f = cap.read()
         if ret:
             frames.append(f)
     cap.release()
-    logger.info(f"Background: sampled {len(frames)} frames")
+    logger.info(f"Background: sampled {len(frames)} frames (first {sample_end})")
     return frames
 
 
@@ -69,15 +77,15 @@ def build_detector(args, source: str) -> BaseDetector:
 
     if args.detector == "ensemble":
         from core.ensemble_detector import EnsembleDetector
-        logger.info("Using EnsembleDetector (bg-sub + hybrid + Kalman)")
+        logger.info("Using EnsembleDetector (bg-sub + hybrid + color + Kalman)")
         det = EnsembleDetector()
-        bg = sample_background(source, BGSUB["bg_samples"])
+        bg = sample_background(source, BGSUB["bg_samples"], args.max_frames)
         det.set_background(bg)
         return det
 
     if args.detector == "hybrid":
         from core.hybrid import HybridDetector
-        logger.info("Using HybridDetector (improved)")
+        logger.info("Using HybridDetector")
         return HybridDetector()
 
     if args.detector == "tracknetv3":
@@ -92,18 +100,20 @@ def build_detector(args, source: str) -> BaseDetector:
 
 
 def run_single_pass(args: argparse.Namespace) -> None:
-    """Standard single-pass pipeline (real-time capable)."""
+    """Single-pass pipeline with scene-cut awareness."""
     detector = build_detector(args, args.source)
-    tracker  = BallTracker()
-    buf      = FrameBuffer(size=detector.window_size)
-    court    = CourtZoneFilter()
-    static   = StationarityFilter()
-    roi      = ROIFilter()  # fallback if court zone not calibrated
+    tracker = BallTracker()
+    buf = FrameBuffer(size=detector.window_size)
+    court = CourtZoneFilter()
+    static = StationarityFilter()
+    roi = ROIFilter()
+    scene_cut = SceneCutDetector()
 
     frame_idx = 0
     fps_timer = time.time()
-    fps_disp  = 0.0
+    fps_disp = 0.0
     court_calibrated = False
+    scene_frames: list = []
 
     with VideoReader(args.source) as vr:
         out_path = Path(args.save) if args.save else OUTPUT_DIR / "tracked.mp4"
@@ -113,10 +123,27 @@ def run_single_pass(args: argparse.Namespace) -> None:
                 if args.max_frames and frame_idx > args.max_frames:
                     break
 
-                # Calibrate court zone on first frame
+                # Scene cut detection → reset everything
+                if SCENE_CUT["enabled"] and scene_cut.check(frame):
+                    logger.info(f"Scene cut at frame {frame_idx}")
+                    if hasattr(detector, "reset"):
+                        detector.reset()
+                    static.reset_full()
+                    buf.clear()
+                    tracker.reset()
+                    court_calibrated = False
+                    scene_frames.clear()
+
+                scene_frames.append(frame)
+                bg_n = SCENE_CUT.get("bg_rebuild_frames", 20)
+                if len(scene_frames) == bg_n and hasattr(detector, "set_background"):
+                    detector.set_background(scene_frames)
+
                 if not court_calibrated and COURT_ZONE["enabled"]:
                     court.calibrate(frame)
                     court_calibrated = True
+                    if hasattr(detector, 'set_court_mask') and court._mask is not None:
+                        detector.set_court_mask(court._mask)
 
                 now = time.time()
                 fps_disp = 0.9 * fps_disp + 0.1 / max(now - fps_timer, 1e-6)
@@ -124,12 +151,10 @@ def run_single_pass(args: argparse.Namespace) -> None:
 
                 buf.push(frame)
                 detection = (
-                    detector.predict(buf.get_window())
-                    if buf.ready() else None
+                    detector.predict(buf.get_window()) if buf.ready() else None
                 )
 
                 h, w = frame.shape[:2]
-                # Filter chain: court zone → stationarity → ROI fallback
                 if court_calibrated:
                     detection = court(detection, h, w)
                 else:
