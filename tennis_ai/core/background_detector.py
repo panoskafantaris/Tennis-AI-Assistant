@@ -1,15 +1,17 @@
 """
-Background Subtraction detector — finds the ball as a bright foreground
-object against a learned static background.
+Background Subtraction detector — finds the ball as a SMALL moving
+foreground object via TopHat + frame motion.
+
+Key insight: the ball is 3-15px diameter. Morphological TopHat removes
+objects larger than the kernel (players, ball baskets, scoreboard).
+Frame-to-frame motion rejects anything static.
 
 Pipeline:
-  1. Build background via median of sampled frames
-  2. Per-frame: abs diff against background → threshold → contours
-  3. Score candidates by: diff intensity × circularity × brightness
-  4. Return best candidate above score threshold
-
-This detector dramatically outperforms HSV-only on broadcast footage
-where the ball color shifts due to court surface, compression, and lighting.
+  1. Background diff → TopHat (removes large objects)
+  2. Frame motion mask (removes static objects)
+  3. Combine: TopHat ∩ motion ∩ court zone
+  4. Contour analysis: area, circularity, brightness, motion scoring
+  5. Return top-K candidates sorted by score
 """
 import logging
 from typing import List, Optional, Tuple
@@ -22,93 +24,90 @@ from config.settings import BGSUB
 
 logger = logging.getLogger(__name__)
 
+Candidate = Tuple[int, int, float]  # (x, y, score)
+
 
 class BackgroundDetector(BaseDetector):
-    """Ball detection via background subtraction + candidate scoring."""
+    """Ball detection via TopHat + motion filtering."""
 
     def __init__(self):
         self._bg: Optional[np.ndarray] = None
-        self._bg_gray: Optional[np.ndarray] = None
-        self._frame_h = 0
-        self._frame_w = 0
+        self._tophat_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (21, 21),
+        )
 
     @property
     def window_size(self) -> int:
-        return 3  # needs 3 frames: bg-sub + frame diff for motion
+        return 3
 
     def set_background(self, frames: List[np.ndarray]) -> None:
-        """Build background from median of sampled frames."""
         if not frames:
             return
-        stack = np.stack(
-            [f.astype(np.float32) for f in frames], axis=0,
-        )
+        stack = np.stack([f.astype(np.float32) for f in frames], axis=0)
         self._bg = np.median(stack, axis=0).astype(np.uint8)
-        self._bg_gray = cv2.cvtColor(self._bg, cv2.COLOR_BGR2GRAY)
-        self._frame_h, self._frame_w = self._bg.shape[:2]
         logger.info(f"Background built from {len(frames)} frames")
 
     def predict(
         self, frames: List[np.ndarray],
-    ) -> Optional[Tuple[int, int, float]]:
+    ) -> Optional[Candidate]:
+        """Return best candidate, or None."""
+        candidates = self.predict_topk(frames, k=1)
+        return candidates[0] if candidates else None
+
+    def predict_topk(
+        self, frames: List[np.ndarray], k: int = 5,
+    ) -> List[Candidate]:
+        """Return up to k candidates sorted by score (best first)."""
         if len(frames) < self.window_size or self._bg is None:
-            return None
+            return []
 
         current = frames[-1]
         prev = frames[-2]
         h, w = current.shape[:2]
 
-        # Compute background difference
-        bg_diff = cv2.absdiff(current, self._bg)
-        bg_gray = cv2.cvtColor(bg_diff, cv2.COLOR_BGR2GRAY)
+        # 1. Background diff → TopHat (kills large objects)
+        bg_diff = cv2.cvtColor(
+            cv2.absdiff(current, self._bg), cv2.COLOR_BGR2GRAY,
+        )
+        tophat = cv2.morphologyEx(bg_diff, cv2.MORPH_TOPHAT, self._tophat_kernel)
 
-        # Also compute frame-to-frame diff for motion confirmation
+        # 2. Frame-to-frame motion (kills static objects)
         motion = cv2.absdiff(
             cv2.cvtColor(current, cv2.COLOR_BGR2GRAY),
             cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY),
         )
 
-        # Threshold foreground
-        _, fg_mask = cv2.threshold(
-            bg_gray, BGSUB["diff_thresh"], 255, cv2.THRESH_BINARY,
-        )
+        # 3. Threshold and combine
+        _, th_bin = cv2.threshold(tophat, 10, 255, cv2.THRESH_BINARY)
+        _, mo_bin = cv2.threshold(motion, 6, 255, cv2.THRESH_BINARY)
+        combined = cv2.bitwise_and(th_bin, mo_bin)
 
-        # Light cleanup — small kernel to preserve tiny blobs
+        # Light cleanup
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
+        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
 
-        # Find contours
         contours, _ = cv2.findContours(
-            fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+            combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
         )
 
-        # Score each candidate
+        # 4. Score candidates
         hsv = cv2.cvtColor(current, cv2.COLOR_BGR2HSV)
-        candidates = []
+        scored: List[Candidate] = []
+
         for cnt in contours:
             cand = self._score_candidate(
-                cnt, bg_gray, motion, hsv, h, w,
+                cnt, tophat, motion, hsv, h, w,
             )
             if cand is not None:
-                candidates.append(cand)
+                scored.append(cand)
 
-        if not candidates:
-            return None
-
-        # Return highest scoring candidate
-        candidates.sort(key=lambda c: -c[2])
-        return candidates[0]
+        scored.sort(key=lambda c: -c[2])
+        return scored[:k]
 
     def _score_candidate(
-        self,
-        cnt,
-        bg_diff_gray: np.ndarray,
-        motion: np.ndarray,
-        hsv: np.ndarray,
-        frame_h: int,
-        frame_w: int,
-    ) -> Optional[Tuple[int, int, float]]:
-        """Score a contour as a ball candidate. Returns (x, y, score)."""
+        self, cnt, tophat: np.ndarray, motion: np.ndarray,
+        hsv: np.ndarray, frame_h: int, frame_w: int,
+    ) -> Optional[Candidate]:
         area = cv2.contourArea(cnt)
         if not (BGSUB["min_area"] <= area <= BGSUB["max_area"]):
             return None
@@ -119,45 +118,37 @@ class BackgroundDetector(BaseDetector):
         cx = int(M["m10"] / M["m00"])
         cy = int(M["m01"] / M["m00"])
 
-        # Bounds check
         if cx < 2 or cx >= frame_w - 2 or cy < 2 or cy >= frame_h - 2:
             return None
 
-        # Background diff intensity at centroid
-        diff_val = float(bg_diff_gray[cy, cx])
-        if diff_val < BGSUB["min_diff_score"]:
+        # TopHat value — how "small and bright" is this spot
+        tv = float(tophat[cy, cx])
+        if tv < 8:
             return None
 
-        # HSV check — ball is bright, not deeply saturated
-        h_val, s_val, v_val = hsv[cy, cx]
-        if v_val < BGSUB["min_brightness"]:
+        # Frame motion — how much did this pixel move
+        mv = float(motion[cy, cx])
+        if mv < 4:
             return None
-        if s_val > BGSUB["max_saturation"]:
+
+        # Brightness check
+        v_val = int(hsv[cy, cx, 2])
+        if v_val < BGSUB["min_brightness"]:
             return None
 
         # Circularity
-        perimeter = cv2.arcLength(cnt, True)
-        circ = (4 * np.pi * area / (perimeter ** 2)) if perimeter > 1 else 0
+        perim = cv2.arcLength(cnt, True)
+        circ = (4 * np.pi * area / (perim ** 2)) if perim > 1 else 0
 
-        # Motion confirmation — strongest discriminator
-        # Real ball has motion > 20, static logos have motion ≈ 0
-        motion_val = float(motion[cy, cx])
-        motion_score = min(motion_val / 50.0, 1.0)
-
-        # Size penalty — ball is 5-80px; players/text > 100px
+        # Size: ball-typical (3-60px) gets full credit; larger penalized
         large_thresh = BGSUB.get("large_area_thresh", 100)
-        if area > large_thresh:
-            size_score = 0.3
-        elif area < 5:
-            size_score = 0.5
-        else:
-            size_score = 1.0
+        size_score = 1.0 if area <= large_thresh else 0.3
 
         # Combined score: motion dominates
         score = (
-            (diff_val / 150.0) * 0.20    # diff contribution
-            + motion_score * 0.40          # motion is king
-            + circ * 0.20                  # roundness
-            + size_score * 0.20            # size appropriateness
+            min(tv / 50.0, 1.5) * 0.30
+            + min(mv / 50.0, 1.5) * 0.35
+            + circ * 0.20
+            + size_score * 0.15
         )
         return (cx, cy, float(score))

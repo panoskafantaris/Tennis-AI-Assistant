@@ -113,14 +113,14 @@ ROI = {
 
 # ── Court zone filter (polygon — primary spatial filter) ─────────
 COURT_ZONE = {
-    "enabled"       : True,
-    "margin_top"    : 0.04,     # extra margin above topmost court line
-    "margin_side"   : 0.03,     # extra margin beyond sidelines
-    "manual_polygon": {         # fallback if auto-detection fails
-        "top_left"     : (0.10, 0.14),   # (x_frac, y_frac) of frame
-        "top_right"    : (0.80, 0.14),
-        "bottom_right" : (0.85, 0.68),
-        "bottom_left"  : (0.05, 0.68),
+    "enabled"        : True,
+    "margin_px"      : 40,      # pixels beyond sidelines
+    "margin_top_px"  : 50,      # extra above far baseline for serves
+    "manual_polygon" : {        # fallback: perspective trapezoid (fraction)
+        "top_left"     : (0.16, 0.17),  # narrow at far end
+        "top_right"    : (0.72, 0.17),
+        "bottom_right" : (0.80, 0.70),  # wide at near end
+        "bottom_left"  : (0.08, 0.70),
     },
 }
 
